@@ -1,0 +1,264 @@
+/*************************
+Developer : Mayank Anand
+Details : Azure to Veeva connection for suggestion record creation
+
+**************************/
+
+@RestResource(urlMapping='/via_RegsitrationAPIController/*')
+global with sharing class via_RegsitrationAPIController {
+
+    private static Set<String> fieldsToIgnore = new Set<String>{
+        'Owner.Name',
+        'Account_vod__r.Name',
+        'Account_vod__r.PersonEmail',
+        'RecordType.Name'
+    };
+
+    public class InsertionResponse {
+        public Integer statusCode;
+        public Integer recordCount;
+        public String errorMessage;
+        public List<String> debugLogs;
+
+        public InsertionResponse(Integer statusCode, Integer recordCount, String errorMessage, List<String> debugLogs) {
+            this.statusCode = statusCode;
+            this.recordCount = recordCount;
+            this.errorMessage = errorMessage;
+            this.debugLogs = debugLogs;
+        }
+    }
+
+    @HttpPost
+    global static void createSuggestionsFromCSV() {
+        RestRequest req = RestContext.request;
+        RestResponse res = RestContext.response;
+
+        String csvBody = extractCSVContent(req.requestBody.toString());
+        InsertionResponse response = parseCSVAndInsert(csvBody);
+
+        res.statusCode = response.statusCode;
+        res.addHeader('Content-Type', 'application/json');
+        res.responseBody = Blob.valueOf(JSON.serialize(response));
+    }
+
+  
+    private static String extractCSVContent(String body) {
+        List<String> debugLogs = new List<String>();
+        debugLogs.add('Raw request body: ' + body);
+        
+   
+        Integer startIndex = body.indexOf('OwnerId');
+        Integer endIndex = body.lastIndexOf('--'); // End boundary
+        if (startIndex == -1 || endIndex == -1) {
+            throw new StringException('CSV content not found in the request body.');
+        }
+
+       
+        String csvContent = body.substring(startIndex, endIndex).trim();
+        
+        debugLogs.add('Extracted CSV content: ' + csvContent);
+        return csvContent;
+    }
+
+private static InsertionResponse parseCSVAndInsert(String csvString) {
+    List<String> debugLogs = new List<String>();
+    List<String> errorMessages = new List<String>();
+
+    debugLogs.add('CSV String received: ' + csvString);
+
+  
+    List<String> lines = csvString.split('\\r?\\n');
+    debugLogs.add('Total lines in CSV: ' + lines.size());
+
+    if (lines.isEmpty()) {
+        return new InsertionResponse(400, 0, 'CSV file is empty', debugLogs);
+    }
+
+    
+    List<String> headers = fastParseCSVLine(lines[0]);
+    debugLogs.add('Number of headers: ' + headers.size());
+    debugLogs.add('Headers: ' + String.join(headers, ', '));
+
+   
+    Map<String, Schema.SObjectField> fieldMap = Schema.SObjectType.Suggestion_vod__c.fields.getMap();
+    Set<String> validFieldNames = new Set<String>();
+    for (String fieldName : fieldMap.keySet()) {
+        validFieldNames.add(fieldName.toLowerCase());
+    }
+
+    // Map headers to valid fields, skipping invalid ones
+    Map<String, String> headerToFieldMap = new Map<String, String>();
+    for (String header : headers) {
+        String trimmedHeader = header.trim();
+        if (validFieldNames.contains(trimmedHeader.toLowerCase())) {
+            headerToFieldMap.put(trimmedHeader, trimmedHeader);
+            debugLogs.add('Valid header mapped: ' + trimmedHeader);
+        } else {
+            debugLogs.add('Invalid or unmapped header: ' + trimmedHeader + ' (skipped)');
+        }
+    }
+
+    if (headerToFieldMap.isEmpty()) {
+        return new InsertionResponse(400, 0, 'No valid headers found in CSV.', debugLogs);
+    }
+
+    List<Suggestion_vod__c> allSuggestions = new List<Suggestion_vod__c>();
+    Integer totalRecords = 0;
+    Integer successCount = 0;
+
+    // Process all lines after the header
+    for (Integer i = 1; i < lines.size(); i++) {
+        String line = lines[i].trim();
+        if (!String.isBlank(line)) {
+            List<String> values = fastParseCSVLine(line);
+            debugLogs.add('Line ' + (i + 1) + ' parsed values: ' + String.join(values, ', '));
+
+            // Dynamically adjust the number of columns to the size of the valid headers
+            if (values.size() >= headers.size()) {
+                Suggestion_vod__c suggestion = createSuggestion(headers, values, headerToFieldMap, fieldMap, i + 1, errorMessages);
+                if (suggestion != null) {
+                    if (String.isBlank((String)suggestion.get('Account_vod__c'))) {
+                        errorMessages.add('Line ' + (i + 1) + ': Required field Account_vod__c is missing.');
+                    } else {
+                        allSuggestions.add(suggestion);
+                        totalRecords++;
+                    }
+                }
+            } else {
+                errorMessages.add('Line ' + (i + 1) + ' has fewer fields than expected.');
+            }
+        }
+    }
+
+  
+    if (!allSuggestions.isEmpty()) {
+        List<Database.SaveResult> saveResults = Database.insert(allSuggestions, false);
+        for (Database.SaveResult sr : saveResults) {
+            if (sr.isSuccess()) {
+                successCount++;
+            } else {
+                for (Database.Error err : sr.getErrors()) {
+                    errorMessages.add('Error on record: ' + err.getMessage());
+                }
+            }
+        }
+    }
+
+    debugLogs.add('Total records processed: ' + totalRecords);
+    debugLogs.add('Successfully inserted suggestions: ' + successCount);
+
+    if (!errorMessages.isEmpty()) {
+        return new InsertionResponse(207, successCount, String.join(errorMessages, '\n'), debugLogs);
+    }
+
+    return new InsertionResponse(200, successCount, null, debugLogs);
+}
+
+
+
+
+    private static List<String> fastParseCSVLine(String line) {
+        List<String> result = new List<String>();
+        Integer length = line.length();
+        Boolean inQuotes = false;
+        Integer startIdx = 0;
+
+        for (Integer i = 0; i < length; i++) {
+            String currentChar = line.substring(i, i + 1);
+            if (currentChar == '"') {
+                inQuotes = !inQuotes;
+            } else if (currentChar == ',' && !inQuotes) {
+                result.add(line.substring(startIdx, i).trim());
+                startIdx = i + 1;
+            }
+        }
+        result.add(line.substring(startIdx).trim());
+
+        return result;
+    }
+
+    private static Suggestion_vod__c createSuggestion(List<String> headers, List<String> values, Map<String, String> headerToFieldMap, Map<String, Schema.SObjectField> fieldMap, Integer lineNumber, List<String> errorMessages) {
+        Suggestion_vod__c suggestion = new Suggestion_vod__c();
+
+        for (Integer j = 0; j < headers.size(); j++) {
+            String header = headers[j].trim();
+            String fieldName = headerToFieldMap.get(header);
+            String value = values[j].trim();
+
+            if (fieldName != null && !fieldsToIgnore.contains(fieldName) && !String.isBlank(value)) {
+                try {
+                    setFieldValue(suggestion, fieldName, value, fieldMap.get(fieldName));
+                } catch (Exception e) {
+                    errorMessages.add('Error on line ' + lineNumber + ', field ' + fieldName + ': ' + e.getMessage());
+                    return null;
+                }
+            }
+        }
+
+        return suggestion;
+    }
+
+    private static void setFieldValue(Suggestion_vod__c suggestion, String fieldName, String value, Schema.SObjectField field) {
+        Schema.DisplayType fieldType = field.getDescribe().getType();
+
+        switch on fieldType {
+            when STRING, TEXTAREA {
+                suggestion.put(fieldName, value);
+            }
+            when BOOLEAN {
+                suggestion.put(fieldName, value.toLowerCase() == 'true');
+            }
+            when INTEGER, DOUBLE {
+                suggestion.put(fieldName, Decimal.valueOf(value));
+            }
+            when DATE {
+                suggestion.put(fieldName, parseDate(value));
+            }
+            when DATETIME {
+                suggestion.put(fieldName, parseDateTime(value));
+            }
+            when REFERENCE {
+                suggestion.put(fieldName, Id.valueOf(value));
+            }
+            when PICKLIST {
+                suggestion.put(fieldName, value);
+            }
+            when else {
+                throw new IllegalArgumentException('Unsupported field type: ' + fieldType);
+            }
+        }
+    }
+
+    private static Date parseDate(String dateStr) {
+        List<String> parts = dateStr.split('-');
+        if (parts.size() != 3) {
+            throw new IllegalArgumentException('Invalid date format. Expected YYYY-MM-DD, got: ' + dateStr);
+        }
+        
+        Integer year = Integer.valueOf(parts[0]);
+        Integer month = Integer.valueOf(parts[1]);
+        Integer day = Integer.valueOf(parts[2]);
+        
+        
+        if (year < 100) {
+            year += 2000; 
+        }
+        
+        return Date.newInstance(year, month, day);
+    }
+    
+    private static Datetime parseDateTime(String dateTimeStr) {
+      
+        try {
+            return Datetime.valueOf(dateTimeStr);
+        } catch (Exception e) {
+           
+            try {
+                Date dateValue = parseDate(dateTimeStr);
+                return Datetime.newInstance(dateValue.year(), dateValue.month(), dateValue.day());
+            } catch (Exception innerE) {
+                throw new IllegalArgumentException('Invalid datetime format. Expected YYYY-MM-DD HH:mm:ss or YYYY-MM-DD, got: ' + dateTimeStr);
+            }
+        }
+    }
+}
